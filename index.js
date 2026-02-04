@@ -11,7 +11,9 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
         origin: "*", // À remplacer par ton URL de production (Vercel/Netlify)
-        methods: ["GET", "POST"]
+        methods: ["GET", "POST"],
+        pingTimeout: 60000,  // 1 minute : Temps d'attente sans réponse avant de déconnecter
+        pingInterval: 25000  // 25s : Fréquence à laquelle le serveur envoie un "ping"
     }
 });
 
