@@ -162,9 +162,7 @@ function startNewRound(room) {
     if (deck.length > 0) {
         room.gameState.trump = deck[0];
     } else {
-        const dealer = room.players[room.gameState.dealerIndex];
-        const lastCard = dealer.hand[dealer.hand.length - 1];
-        room.gameState.trump = { suit: lastCard.suit, value: lastCard.value };
+        room.gameState.trump = { suit: 'SA', value: 'Sans Atout' };
     }
 
     room.gameState.currentPlayerIndex = (room.gameState.dealerIndex + 1) % 4;
