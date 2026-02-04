@@ -10,7 +10,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // Au début pour tester, puis remplace par ton URL Vercel
+        origin: "*", // À remplacer par ton URL de production (Vercel/Netlify)
         methods: ["GET", "POST"]
     }
 });
@@ -32,7 +32,6 @@ function broadcast(roomId) {
         ...room.gameState,
         nbCards: Engine.getCardsCount(room.gameState.currentRound),
         currentPlayer: room.players[room.gameState.currentPlayerIndex]?.id,
-        // Sécurité : On ne diffuse JAMAIS les mains des joueurs
         players: room.players.map(p => ({
             id: p.id,
             name: p.name,
@@ -57,6 +56,8 @@ io.on('connection', (socket) => {
 
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
+            // SYNC : On renvoie l'état actuel de la table pour que le joueur ne voie pas un tapis vide
+            socket.emit('tableUpdate', { table: room.gameState.table });
         } else if (room.players.length === 4) {
             startNewRound(room);
         }
@@ -72,18 +73,13 @@ io.on('connection', (socket) => {
         const player = room.players[room.gameState.currentPlayerIndex];
         if (player?.id !== socket.id) return;
 
-        // --- NOUVELLE LOGIQUE D'INTERDICTION GLISSANTE ---
-        const bidsSoFar = room.players
-            .filter(p => p.bid !== null)
-            .map(p => p.bid);
-
+        const bidsSoFar = room.players.filter(p => p.bid !== null).map(p => p.bid);
         const nbCards = Engine.getCardsCount(room.gameState.currentRound);
         const forbidden = Engine.getForbiddenBid(nbCards, bidsSoFar);
 
         if (forbidden !== null && bidValue === forbidden) {
             return socket.emit('error_message', `Pari interdit ! Le total du round ne doit pas être égal à ${nbCards}.`);
         }
-        // ------------------------------------------------
 
         player.bid = bidValue;
         room.gameState.currentPlayerIndex = (room.gameState.currentPlayerIndex + 1) % 4;
@@ -105,7 +101,13 @@ io.on('connection', (socket) => {
         const player = room.players[room.gameState.currentPlayerIndex];
         if (player?.id !== socket.id) return;
 
-        // Utilise la règle stricte du Engine : Fournir ou Couper !
+        // SÉCURITÉ : Vérifier que le joueur possède réellement la carte
+        const hasCard = player.hand.some(c => c.suit === card.suit && c.value === card.value);
+        if (!hasCard) {
+            return socket.emit('error_message', "Vous n'avez pas cette carte en main !");
+        }
+
+        // Vérification des règles (Fournir ou Couper)
         if (!Engine.isMoveLegal(player.hand, card, room.gameState.table, room.gameState.trump.suit)) {
             return socket.emit('error_message', "Coup illégal ! Vous devez fournir la couleur ou couper !");
         }
@@ -154,15 +156,12 @@ function startNewRound(room) {
         io.to(p.id).emit('yourHand', p.hand);
     });
 
-    /** * CORRECTION LOGIQUE ATOUT (32 CARTES)
-     * Si le deck est vide (Round de 8), l'atout est la dernière carte du donneur.
-     */
+    // Atout : dernière carte du donneur si le paquet est vide (Rounds à 8 cartes)
     if (deck.length > 0) {
         room.gameState.trump = deck[0];
     } else {
         const dealer = room.players[room.gameState.dealerIndex];
         const lastCard = dealer.hand[dealer.hand.length - 1];
-        // On crée une copie pour l'atout sans retirer la carte de la main du joueur
         room.gameState.trump = { suit: lastCard.suit, value: lastCard.value };
     }
 
@@ -184,19 +183,16 @@ function finishRound(room) {
     room.gameState.currentRound++;
     room.gameState.dealerIndex = (room.gameState.dealerIndex + 1) % 4;
 
-    if (room.gameState.currentRound <= 18) {
-        startNewRound(room);
-    } else {
-        io.to(room.id).emit('gameOver', room.players);
-        room.gameState.status = 'FINISHED';
-    }
+    // TEMPO : On laisse 4 secondes aux joueurs pour voir les scores avant la nouvelle donne
+    setTimeout(() => {
+        if (room.gameState.currentRound <= 18) {
+            startNewRound(room);
+        } else {
+            io.to(room.id).emit('gameOver', room.players);
+            room.gameState.status = 'FINISHED';
+        }
+    }, 4000);
 }
 
 const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, () => {
-    console.log(`---`);
-    console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL`);
-    console.log(`📡 Port : ${PORT}`);
-    console.log(`---`);
-});
+server.listen(PORT, () => console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`));

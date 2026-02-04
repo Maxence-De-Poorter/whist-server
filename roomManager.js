@@ -92,6 +92,13 @@ class RoomManager {
             }, 60000);
 
             room.timers.set(player.name, timer);
+
+            const anyoneLeft = room.players.some(p => p.online);
+            if (!anyoneLeft) {
+                console.log(`🧹 Salle ${roomId} vide, suppression immédiate.`);
+                this.rooms.delete(roomId);
+            }
+
             return roomId;
         }
         return null;
