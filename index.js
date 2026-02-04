@@ -114,13 +114,13 @@ io.on('connection', (socket) => {
             return socket.emit('error_message', "Coup illégal ! Vous devez fournir la couleur ou couper !");
         }
 
-        room.gameState.table.push({ playerId: socket.id, card });
+        room.gameState.table.push({ playerName: player.name, card });
         player.hand = player.hand.filter(c => !(c.suit === card.suit && c.value === card.value));
 
         if (room.gameState.table.length === 4) {
             broadcast(roomId);
             const winnerMove = Engine.evaluateTrick(room.gameState.table, room.gameState.trump.suit);
-            const winner = room.players.find(p => p.id === winnerMove.playerId);
+            const winner = room.players.find(p => p.name === winnerMove.playerName);
             winner.tricksWon++;
             room.gameState.currentPlayerIndex = room.players.indexOf(winner);
 
