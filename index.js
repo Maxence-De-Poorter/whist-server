@@ -7,22 +7,17 @@ const Engine = require('./gameEngine');
 
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
+
 const io = new Server(server, {
     cors: {
-        origin: "*", // À remplacer par ton URL de production (Vercel/Netlify)
-        methods: ["GET", "POST"],
-        pingTimeout: 60000,  // 1 minute : Temps d'attente sans réponse avant de déconnecter
-        pingInterval: 25000  // 25s : Fréquence à laquelle le serveur envoie un "ping"
-    }
+        origin: "*", // ⚠️ À restreindre en production
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
-
-/**
- * Utilitaire : Récupère l'ID de la room du socket de manière fiable
- */
-function getSocketRoom(socket) {
-    return Array.from(socket.rooms).find(r => r !== socket.id);
-}
 
 /**
  * Diffuse l'état complet de la partie aux membres d'une room
@@ -30,6 +25,7 @@ function getSocketRoom(socket) {
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
     if (!room) return;
+
     io.to(roomId).emit('gameStateUpdate', {
         ...room.gameState,
         nbCards: Engine.getCardsCount(room.gameState.currentRound),
@@ -50,6 +46,10 @@ io.on('connection', (socket) => {
 
     // --- REJOINDRE ---
     socket.on('joinRoom', ({ roomId, pseudo }) => {
+        if (!roomId || !pseudo) {
+            return socket.emit('error_message', "Paramètres invalides.");
+        }
+
         const result = RoomManager.createOrJoin(roomId, socket, pseudo);
         if (result.error) return socket.emit('error_message', result.error);
 
@@ -58,81 +58,150 @@ io.on('connection', (socket) => {
 
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
-            // SYNC : On renvoie l'état actuel de la table pour que le joueur ne voie pas un tapis vide
             socket.emit('tableUpdate', { table: room.gameState.table });
-        } else if (room.players.length === 4) {
+        }
+        else if (room.players.length === 4 && room.gameState.status === 'WAITING') {
             startNewRound(room);
         }
+
         broadcast(room.id);
     });
 
-    // --- PARIS (BIDDING) ---
+    // --- PARIS ---
     socket.on('placeBid', (bidValue) => {
-        const roomId = getSocketRoom(socket);
+        const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
+
         if (!room || room.gameState.status !== 'BIDDING') return;
 
         const player = room.players[room.gameState.currentPlayerIndex];
-        if (player?.id !== socket.id) return;
+        if (!player || player.id !== socket.id) return;
 
-        const bidsSoFar = room.players.filter(p => p.bid !== null).map(p => p.bid);
         const nbCards = Engine.getCardsCount(room.gameState.currentRound);
+
+        // ✅ Validation stricte
+        if (
+            typeof bidValue !== 'number' ||
+            bidValue < 0 ||
+            bidValue > nbCards
+        ) {
+            return socket.emit('error_message', "Pari invalide.");
+        }
+
+        const bidsSoFar = room.players
+            .filter(p => p.bid !== null)
+            .map(p => p.bid);
+
         const forbidden = Engine.getForbiddenBid(nbCards, bidsSoFar);
 
         if (forbidden !== null && bidValue === forbidden) {
-            return socket.emit('error_message', `Pari interdit ! Le total du round ne doit pas être égal à ${nbCards}.`);
+            return socket.emit(
+                'error_message',
+                `Pari interdit ! Le total ne doit pas être égal à ${nbCards}.`
+            );
         }
 
         player.bid = bidValue;
-        room.gameState.currentPlayerIndex = (room.gameState.currentPlayerIndex + 1) % 4;
+        room.gameState.currentPlayerIndex =
+            (room.gameState.currentPlayerIndex + 1) % 4;
 
         if (room.players.every(p => p.bid !== null)) {
             room.gameState.status = 'PLAYING';
-            room.gameState.currentPlayerIndex = (room.gameState.dealerIndex + 1) % 4;
+            room.gameState.currentPlayerIndex =
+                (room.gameState.dealerIndex + 1) % 4;
         }
+
         broadcast(roomId);
     });
 
     // --- JOUER UNE CARTE ---
     socket.on('playCard', (card) => {
-        const roomId = getSocketRoom(socket);
+        const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
 
-        if (!room || room.gameState.status !== 'PLAYING' || room.gameState.table.length >= 4) return;
+        if (!room ||
+            room.gameState.status !== 'PLAYING' ||
+            room.gameState.table.length >= 4
+        ) return;
 
         const player = room.players[room.gameState.currentPlayerIndex];
-        if (player?.id !== socket.id) return;
+        if (!player || player.id !== socket.id) return;
 
-        // SÉCURITÉ : Vérifier que le joueur possède réellement la carte
-        const hasCard = player.hand.some(c => c.suit === card.suit && c.value === card.value);
+        // Vérification possession carte
+        const hasCard = player.hand.some(
+            c => c.suit === card?.suit && c.value === card?.value
+        );
+
         if (!hasCard) {
-            return socket.emit('error_message', "Vous n'avez pas cette carte en main !");
+            return socket.emit('error_message', "Carte invalide.");
         }
 
-        // Vérification des règles (Fournir ou Couper)
-        if (!Engine.isMoveLegal(player.hand, card, room.gameState.table, room.gameState.trump.suit)) {
-            return socket.emit('error_message', "Coup illégal ! Vous devez fournir la couleur ou couper !");
+        const trumpSuit = room.gameState.trump?.suit || 'SA';
+
+        if (!Engine.isMoveLegal(
+            player.hand,
+            card,
+            room.gameState.table,
+            trumpSuit
+        )) {
+            return socket.emit(
+                'error_message',
+                "Coup illégal ! Vous devez fournir ou couper."
+            );
         }
 
-        room.gameState.table.push({ playerName: player.name, card });
-        player.hand = player.hand.filter(c => !(c.suit === card.suit && c.value === card.value));
+        room.gameState.table.push({
+            playerName: player.name,
+            card
+        });
 
+        player.hand = player.hand.filter(
+            c => !(c.suit === card.suit && c.value === card.value)
+        );
+
+        // --- FIN DE PLI ---
         if (room.gameState.table.length === 4) {
-            broadcast(roomId);
-            const winnerMove = Engine.evaluateTrick(room.gameState.table, room.gameState.trump.suit);
-            const winner = room.players.find(p => p.name === winnerMove.playerName);
-            winner.tricksWon++;
-            room.gameState.currentPlayerIndex = room.players.indexOf(winner);
 
-            io.to(roomId).emit('trickOver', { winnerName: winner.name, table: room.gameState.table });
+            broadcast(roomId);
+
+            const winnerMove = Engine.evaluateTrick(
+                room.gameState.table,
+                trumpSuit
+            );
+
+            const winner = room.players.find(
+                p => p.name === winnerMove?.playerName
+            );
+
+            if (!winner) return; // sécurité
+
+            winner.tricksWon++;
+            room.gameState.currentPlayerIndex =
+                room.players.indexOf(winner);
+
+            io.to(roomId).emit('trickOver', {
+                winnerName: winner.name,
+                table: room.gameState.table
+            });
+
+            const isRoundOver =
+                room.players.every(p => p.hand.length === 0);
 
             setTimeout(() => {
+                // 🔒 Vérifier que la room existe toujours
+                if (!RoomManager.getRoom(roomId)) return;
+
                 room.gameState.table = [];
-                if (player.hand.length === 0) finishRound(room);
+
+                if (isRoundOver) finishRound(room);
                 else broadcast(roomId);
+
             }, 2500);
+
         } else {
-            room.gameState.currentPlayerIndex = (room.gameState.currentPlayerIndex + 1) % 4;
+            room.gameState.currentPlayerIndex =
+                (room.gameState.currentPlayerIndex + 1) % 4;
+
             broadcast(roomId);
         }
     });
@@ -144,10 +213,16 @@ io.on('connection', (socket) => {
     });
 });
 
-// --- HELPERS DU JEU ---
+
+// ==============================
+// HELPERS DU JEU
+// ==============================
 
 function startNewRound(room) {
+    if (!room) return;
+
     room.gameState.status = 'BIDDING';
+
     const nb = Engine.getCardsCount(room.gameState.currentRound);
     const deck = Engine.createDeck();
 
@@ -155,44 +230,59 @@ function startNewRound(room) {
         p.hand = deck.splice(0, nb);
         p.bid = null;
         p.tricksWon = 0;
+
         io.to(p.id).emit('yourHand', p.hand);
     });
 
-    // Atout : dernière carte du donneur si le paquet est vide (Rounds à 8 cartes)
-    if (deck.length > 0) {
-        room.gameState.trump = deck[0];
-    } else {
-        room.gameState.trump = { suit: 'SA', value: 'Sans Atout' };
-    }
+    room.gameState.trump =
+        deck.length > 0
+            ? deck[0]
+            : { suit: 'SA', value: 'Sans Atout' };
 
-    room.gameState.currentPlayerIndex = (room.gameState.dealerIndex + 1) % 4;
+    room.gameState.currentPlayerIndex =
+        (room.gameState.dealerIndex + 1) % 4;
+
     broadcast(room.id);
 }
 
 function finishRound(room) {
+    if (!room) return;
+
     const roundRes = {
         round: room.gameState.currentRound,
         results: room.players.map(p => {
             const pts = Engine.calculatePoints(p.bid, p.tricksWon);
             p.score += pts;
-            return { bid: p.bid, points: pts, total: p.score };
+
+            return {
+                bid: p.bid,
+                points: pts,
+                total: p.score
+            };
         })
     };
 
     room.gameState.scoreHistory.push(roundRes);
     room.gameState.currentRound++;
-    room.gameState.dealerIndex = (room.gameState.dealerIndex + 1) % 4;
+    room.gameState.dealerIndex =
+        (room.gameState.dealerIndex + 1) % 4;
 
-    // TEMPO : On laisse 4 secondes aux joueurs pour voir les scores avant la nouvelle donne
     setTimeout(() => {
+
+        if (!RoomManager.getRoom(room.id)) return;
+
         if (room.gameState.currentRound <= 18) {
             startNewRound(room);
         } else {
             io.to(room.id).emit('gameOver', room.players);
             room.gameState.status = 'FINISHED';
         }
+
     }, 4000);
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`));
+
+server.listen(PORT, () =>
+    console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`)
+);

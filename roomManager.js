@@ -1,27 +1,42 @@
-const Engine = require('./gameEngine');
-
 class RoomManager {
     constructor() {
         this.rooms = new Map();
-        // Optimisation : lien direct socketId -> roomId pour éviter les boucles
         this.socketToRoom = new Map();
     }
 
     getRoom(roomId) {
-        return roomId ? this.rooms.get(roomId.toUpperCase()) : null;
+        if (!roomId || typeof roomId !== 'string') return null;
+        return this.rooms.get(roomId.toUpperCase()) || null;
     }
 
     createOrJoin(roomId, socket, pseudo) {
-        roomId = roomId.toUpperCase();
+        if (
+            !roomId ||
+            !pseudo ||
+            typeof roomId !== 'string' ||
+            typeof pseudo !== 'string'
+        ) {
+            return { error: "Paramètres invalides." };
+        }
+
+        roomId = roomId.toUpperCase().trim();
+        pseudo = pseudo.trim();
+
         let room = this.rooms.get(roomId);
 
+        // --- Création room ---
         if (!room) {
             room = {
                 id: roomId,
                 players: [],
                 gameState: {
-                    currentRound: 1, dealerIndex: 0, currentPlayerIndex: 0,
-                    status: 'WAITING', trump: null, table: [], scoreHistory: []
+                    currentRound: 1,
+                    dealerIndex: 0,
+                    currentPlayerIndex: 0,
+                    status: 'WAITING',
+                    trump: null,
+                    table: [],
+                    scoreHistory: []
                 },
                 timers: new Map()
             };
@@ -30,41 +45,60 @@ class RoomManager {
 
         const existingPlayer = room.players.find(p => p.name === pseudo);
 
-        // 1. GESTION RECONNEXION
+        // ==========================
+        // 1️⃣ RECONNEXION
+        // ==========================
         if (existingPlayer) {
-            // SÉCURITÉ : Empêcher de prendre la place de quelqu'un de déjà connecté
+
             if (existingPlayer.online) {
-                return { error: "Ce pseudo est déjà utilisé et le joueur est en ligne." };
+                return {
+                    error: "Ce pseudo est déjà utilisé et le joueur est en ligne."
+                };
             }
 
             existingPlayer.id = socket.id;
             existingPlayer.online = true;
+
             this.socketToRoom.set(socket.id, roomId);
 
+            // Annuler timer si existant
             if (room.timers.has(pseudo)) {
                 clearTimeout(room.timers.get(pseudo));
                 room.timers.delete(pseudo);
             }
-            return { room, player: existingPlayer, isReconnection: true };
-        }
 
-        // 2. NOUVEAU JOUEUR
-        if (room.players.length < 4) {
-            const newPlayer = {
-                id: socket.id,
-                name: pseudo,
-                hand: [],
-                bid: null,
-                tricksWon: 0,
-                score: 0,
-                online: true
+            return {
+                room,
+                player: existingPlayer,
+                isReconnection: true
             };
-            room.players.push(newPlayer);
-            this.socketToRoom.set(socket.id, roomId);
-            return { room, player: newPlayer, isReconnection: false };
         }
 
-        return { error: "La salle est pleine." };
+        // ==========================
+        // 2️⃣ NOUVEAU JOUEUR
+        // ==========================
+        if (room.players.length >= 4) {
+            return { error: "La salle est pleine." };
+        }
+
+        const newPlayer = {
+            id: socket.id,
+            name: pseudo,
+            hand: [],
+            bid: null,
+            tricksWon: 0,
+            score: 0,
+            online: true
+        };
+
+        room.players.push(newPlayer);
+        this.socketToRoom.set(socket.id, roomId);
+
+        return {
+            room,
+            player: newPlayer,
+            isReconnection: false
+        };
     }
 
     handleDisconnect(socket, io) {
@@ -72,36 +106,75 @@ class RoomManager {
         if (!roomId) return null;
 
         const room = this.rooms.get(roomId);
-        if (!room) return null;
+        if (!room) {
+            this.socketToRoom.delete(socket.id);
+            return null;
+        }
 
         const player = room.players.find(p => p.id === socket.id);
-        if (player) {
-            player.online = false;
+        if (!player) {
             this.socketToRoom.delete(socket.id);
-
-            console.log(`⏱️ Attente reconnexion : ${player.name} (${roomId})`);
-
-            const timer = setTimeout(() => {
-                if (!player.online) {
-                    console.log(`💀 Suppression de la room ${roomId} (Joueur ${player.name} perdu)`);
-                    io.to(roomId).emit('error_message', `Partie terminée : ${player.name} a mis trop de temps à revenir.`);
-                    this.rooms.delete(roomId);
-                    // Nettoyer les socketToRoom restants pour cette room
-                    room.players.forEach(p => this.socketToRoom.delete(p.id));
-                }
-            }, 60000);
-
-            room.timers.set(player.name, timer);
-
-            const anyoneLeft = room.players.some(p => p.online);
-            if (!anyoneLeft) {
-                console.log(`🧹 Salle ${roomId} vide, suppression immédiate.`);
-                this.rooms.delete(roomId);
-            }
-
-            return roomId;
+            return null;
         }
-        return null;
+
+        player.online = false;
+        this.socketToRoom.delete(socket.id);
+
+        console.log(`⏱️ Attente reconnexion : ${player.name} (${roomId})`);
+
+        // --- Timer de suppression ---
+        const timer = setTimeout(() => {
+            const currentRoom = this.rooms.get(roomId);
+            if (!currentRoom) return;
+
+            const stillOffline = currentRoom.players
+                .find(p => p.name === player.name)?.online === false;
+
+            if (stillOffline) {
+                console.log(
+                    `💀 Suppression de la room ${roomId} (Joueur ${player.name} perdu)`
+                );
+
+                io.to(roomId).emit(
+                    'error_message',
+                    `Partie terminée : ${player.name} a mis trop de temps à revenir.`
+                );
+
+                this.deleteRoom(roomId);
+            }
+        }, 60000);
+
+        room.timers.set(player.name, timer);
+
+        // --- Suppression immédiate si plus personne en ligne ---
+        const anyoneOnline = room.players.some(p => p.online);
+        if (!anyoneOnline) {
+            console.log(`🧹 Salle ${roomId} vide, suppression immédiate.`);
+            this.deleteRoom(roomId);
+        }
+
+        return roomId;
+    }
+
+    // ==========================
+    // 🧹 Suppression propre d'une room
+    // ==========================
+    deleteRoom(roomId) {
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+
+        // Clear tous les timers
+        room.timers.forEach(timer => clearTimeout(timer));
+        room.timers.clear();
+
+        // Nettoyer socketToRoom
+        room.players.forEach(p => {
+            if (p.id) {
+                this.socketToRoom.delete(p.id);
+            }
+        });
+
+        this.rooms.delete(roomId);
     }
 }
 
