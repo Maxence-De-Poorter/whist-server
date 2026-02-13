@@ -80,6 +80,7 @@ function broadcast(roomId) {
     if (!room) return;
 
     io.to(roomId).emit('gameStateUpdate', {
+        roomId: room.id,
         ...room.gameState,
         nbCards: Engine.getCardsCount(room.gameState.currentRound),
         currentPlayer: room.players[room.gameState.currentPlayerIndex]?.id,
