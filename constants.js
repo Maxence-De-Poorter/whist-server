@@ -11,7 +11,7 @@ module.exports = {
 
     /**
      * Puissance en couleur normale
-     * Hiérarchie : 7 < 8 < 9 < 10 < Valet < Dame < Roi < As
+     * Hiérarchie : 7 < 8 < 9 < Valet < Dame < Roi < 10 < As
      */
     POWER_NORMAL: {
         '7': 7, '8': 8, '9': 9, 'V': 10, 'D': 11, 'R': 12, '10': 13, 'A': 14

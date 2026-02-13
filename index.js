@@ -1,12 +1,29 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+
 const RoomManager = require('./roomManager');
 const Engine = require('./gameEngine');
 
 const app = express();
 app.use(cors());
+
+// ==========================
+// SUPABASE SERVER CLIENT
+// ==========================
+
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ==========================
+// ROUTES REST
+// ==========================
 
 app.get('/ping', (req, res) => {
     res.status(200).send('pong');
@@ -17,6 +34,9 @@ app.get('/rooms', (req, res) => {
     res.json(rooms);
 });
 
+// ==========================
+// SOCKET.IO
+// ==========================
 
 const server = http.createServer(app);
 
@@ -29,9 +49,31 @@ const io = new Server(server, {
     pingInterval: 25000
 });
 
+// 🔐 AUTH MIDDLEWARE
+io.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth?.token;
+
+        if (!token) {
+            return next(new Error('UNAUTHORIZED: missing token'));
+        }
+
+        const { data, error } = await supabase.auth.getUser(token);
+
+        if (error || !data?.user) {
+            return next(new Error('UNAUTHORIZED: invalid token'));
+        }
+
+        socket.user = data.user;
+        next();
+
+    } catch (err) {
+        next(new Error('UNAUTHORIZED'));
+    }
+});
 
 /**
- * Diffuse l'état complet de la partie aux membres d'une room
+ * Diffuse l'état complet de la partie
  */
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
@@ -53,18 +95,37 @@ function broadcast(roomId) {
 }
 
 io.on('connection', (socket) => {
-    console.log(`📡 Connexion : ${socket.id}`);
 
-    // --- REJOINDRE ---
-    socket.on('joinRoom', ({ roomId, pseudo }) => {
-        if (!roomId || !pseudo) {
-            return socket.emit('error_message', "Paramètres invalides.");
+    console.log(`📡 Connexion authentifiée : ${socket.user.email}`);
+
+    // ==========================
+    // JOIN ROOM
+    // ==========================
+
+    socket.on('joinRoom', ({ roomId }) => {
+
+        if (!roomId) {
+            return socket.emit('error_message', "Room ID invalide.");
         }
 
-        const result = RoomManager.createOrJoin(roomId, socket, pseudo);
-        if (result.error) return socket.emit('error_message', result.error);
+        const user = socket.user;
+
+        const pseudo =
+            user.user_metadata?.display_name ||
+            user.email ||
+            "Joueur";
+
+        const result = RoomManager.createOrJoin(roomId, socket, {
+            userId: user.id,
+            pseudo
+        });
+
+        if (result.error) {
+            return socket.emit('error_message', result.error);
+        }
 
         const { room, player, isReconnection } = result;
+
         socket.join(room.id);
 
         if (isReconnection) {
@@ -78,8 +139,12 @@ io.on('connection', (socket) => {
         broadcast(room.id);
     });
 
-    // --- PARIS ---
+    // ==========================
+    // PARIS
+    // ==========================
+
     socket.on('placeBid', (bidValue) => {
+
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
 
@@ -90,12 +155,7 @@ io.on('connection', (socket) => {
 
         const nbCards = Engine.getCardsCount(room.gameState.currentRound);
 
-        // ✅ Validation stricte
-        if (
-            typeof bidValue !== 'number' ||
-            bidValue < 0 ||
-            bidValue > nbCards
-        ) {
+        if (typeof bidValue !== 'number' || bidValue < 0 || bidValue > nbCards) {
             return socket.emit('error_message', "Pari invalide.");
         }
 
@@ -125,20 +185,22 @@ io.on('connection', (socket) => {
         broadcast(roomId);
     });
 
-    // --- JOUER UNE CARTE ---
+    // ==========================
+    // JOUER CARTE
+    // ==========================
+
     socket.on('playCard', (card) => {
+
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
 
         if (!room ||
             room.gameState.status !== 'PLAYING' ||
-            room.gameState.table.length >= 4
-        ) return;
+            room.gameState.table.length >= 4) return;
 
         const player = room.players[room.gameState.currentPlayerIndex];
         if (!player || player.id !== socket.id) return;
 
-        // Vérification possession carte
         const hasCard = player.hand.some(
             c => c.suit === card?.suit && c.value === card?.value
         );
@@ -170,7 +232,6 @@ io.on('connection', (socket) => {
             c => !(c.suit === card.suit && c.value === card.value)
         );
 
-        // --- FIN DE PLI ---
         if (room.gameState.table.length === 4) {
 
             broadcast(roomId);
@@ -184,7 +245,7 @@ io.on('connection', (socket) => {
                 p => p.name === winnerMove?.playerName
             );
 
-            if (!winner) return; // sécurité
+            if (!winner) return;
 
             winner.tricksWon++;
             room.gameState.currentPlayerIndex =
@@ -199,7 +260,7 @@ io.on('connection', (socket) => {
                 room.players.every(p => p.hand.length === 0);
 
             setTimeout(() => {
-                // 🔒 Vérifier que la room existe toujours
+
                 if (!RoomManager.getRoom(roomId)) return;
 
                 room.gameState.table = [];
@@ -217,20 +278,18 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- DÉCONNEXION ---
     socket.on('disconnect', () => {
         const roomId = RoomManager.handleDisconnect(socket, io);
         if (roomId) broadcast(roomId);
     });
+
 });
 
-
-// ==============================
-// HELPERS DU JEU
-// ==============================
+// ==========================
+// START ROUND
+// ==========================
 
 function startNewRound(room) {
-    if (!room) return;
 
     room.gameState.status = 'BIDDING';
 
@@ -257,11 +316,11 @@ function startNewRound(room) {
 }
 
 function finishRound(room) {
-    if (!room) return;
 
     const roundRes = {
         round: room.gameState.currentRound,
         results: room.players.map(p => {
+
             const pts = Engine.calculatePoints(p.bid, p.tricksWon);
             p.score += pts;
 
