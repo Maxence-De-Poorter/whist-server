@@ -8,16 +8,22 @@ const Engine = require('./gameEngine');
 const app = express();
 app.use(cors());
 
+// ✅ Route de ping pour UptimeRobot
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
+});
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: "*", // ⚠️ À restreindre en production
+        origin: "*",
         methods: ["GET", "POST"]
     },
     pingTimeout: 60000,
     pingInterval: 25000
 });
+
 
 /**
  * Diffuse l'état complet de la partie aux membres d'une room
