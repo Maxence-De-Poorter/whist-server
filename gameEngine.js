@@ -9,20 +9,21 @@ const {
 module.exports = {
 
     /**
-     * Progression des cartes : 1→8, 8,8,8 puis 8→1
+     * Nombre de cartes par manche :
+     * 1→8, 8,8, puis 8→1 = 18 manches
      */
     getCardsCount: (round) => {
         if (typeof round !== 'number' || round < 1 || round > 18) {
             return 0;
         }
 
-        if (round <= 8) return round;
-        if (round <= 11) return 8;
-        return 18 - round + 1;
+        if (round <= 8) return round;       // 1 → 8
+        if (round <= 10) return 8;          // 9,10 → 8,8
+        return 18 - round + 1;              // 11→18 → 8→1
     },
 
     /**
-     * Création + shuffle Fisher-Yates
+     * Création du paquet complet + mélange Fisher-Yates
      */
     createDeck: () => {
         const deck = [];
@@ -33,7 +34,7 @@ module.exports = {
             }
         }
 
-        // Fisher-Yates sécurisé
+        // Mélange Fisher–Yates
         for (let i = deck.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -43,7 +44,10 @@ module.exports = {
     },
 
     /**
-     * Vérifie si un coup est légal
+     * Vérifie si un coup est légal :
+     * - Fournir la couleur demandée
+     * - Sinon couper (si possible et pas "Sans Atout")
+     * - Sinon libre
      */
     isMoveLegal: (hand, card, table, trumpSuit) => {
 
@@ -56,7 +60,7 @@ module.exports = {
             return false;
         }
 
-        // Premier joueur → toujours légal
+        // Premier joueur du pli → toujours légal
         if (table.length === 0) return true;
 
         const leadSuit = table[0]?.card?.suit;
@@ -64,12 +68,12 @@ module.exports = {
 
         const hasLeadSuit = hand.some(c => c.suit === leadSuit);
 
-        // 1️⃣ Fournir
+        // 1️⃣ Fournir la couleur demandée
         if (hasLeadSuit) {
             return card.suit === leadSuit;
         }
 
-        // 2️⃣ Couper (si atout et pas SA)
+        // 2️⃣ Couper si possible et atout != SA
         if (trumpSuit && trumpSuit !== 'SA') {
             const hasTrump = hand.some(c => c.suit === trumpSuit);
             if (hasTrump) {
@@ -77,12 +81,15 @@ module.exports = {
             }
         }
 
-        // 3️⃣ Libre
+        // 3️⃣ Sinon, libre
         return true;
     },
 
     /**
      * Détermine le gagnant du pli
+     * - L'atout bat la couleur demandée
+     * - En "Sans Atout", seule la couleur demandée compte
+     * - En cas d'égalité de puissance, le premier joueur garde le pli
      */
     evaluateTrick: (table, trumpSuit) => {
 
@@ -106,13 +113,13 @@ module.exports = {
             const currentIsTrump = trumpSuit !== 'SA' && currentSuit === trumpSuit;
             const bestIsTrump = trumpSuit !== 'SA' && bestSuit === trumpSuit;
 
-            // Atout bat non-atout
+            // 🃏 Atout bat non-atout
             if (currentIsTrump && !bestIsTrump) {
                 bestMove = current;
                 continue;
             }
 
-            // Atout vs atout
+            // ⚔️ Atout vs Atout
             if (currentIsTrump && bestIsTrump) {
                 const currentPower = POWER_TRUMP[current.card.value] ?? -1;
                 const bestPower = POWER_TRUMP[bestMove.card.value] ?? -1;
@@ -123,7 +130,7 @@ module.exports = {
                 continue;
             }
 
-            // Même couleur que demandée
+            // 🂡 Même couleur que demandée
             if (!bestIsTrump && currentSuit === leadSuit) {
                 const currentPower = POWER_NORMAL[current.card.value] ?? -1;
                 const bestPower = POWER_NORMAL[bestMove.card.value] ?? -1;
@@ -138,7 +145,9 @@ module.exports = {
     },
 
     /**
-     * Calcul des points
+     * Calcul des points :
+     * - Si le pari est exact → bonus + points par pli
+     * - Sinon → pénalité proportionnelle à l'écart
      */
     calculatePoints: (bid, tricksWon) => {
 
@@ -158,11 +167,15 @@ module.exports = {
             );
         }
 
-        return -(diff * (SCORING.PENALTY_PER_DIFF ?? 0));
+        const penalty = Math.abs(SCORING.PENALTY_PER_DIFF ?? 0);
+        return -diff * penalty;
     },
 
     /**
-     * Règle du pari interdit
+     * Règle du pari interdit :
+     * le dernier joueur ne peut pas faire en sorte
+     * que la somme totale des paris = nb de cartes
+     * ⚠️ À appeler uniquement pour le 4e joueur
      */
     getForbiddenBid: (nbCards, currentBids) => {
 
