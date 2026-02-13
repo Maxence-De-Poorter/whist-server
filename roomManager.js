@@ -176,6 +176,23 @@ class RoomManager {
 
         this.rooms.delete(roomId);
     }
+
+    getPublicRooms() {
+        const roomsList = [];
+
+        this.rooms.forEach((room) => {
+            if (room.players.length > 0) {
+                roomsList.push({
+                    id: room.id,
+                    players: room.players.length,
+                    status: room.gameState.status
+                });
+            }
+        });
+
+        return roomsList;
+    }
+
 }
 
 module.exports = new RoomManager();
