@@ -49,43 +49,47 @@ const io = new Server(server, {
     pingInterval: 25000
 });
 
-// 🔐 AUTH MIDDLEWARE
+// ==========================
+// AUTH MIDDLEWARE
+// ==========================
+
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
-
-        if (!token) {
-            return next(new Error('UNAUTHORIZED: missing token'));
-        }
+        if (!token) return next(new Error('UNAUTHORIZED'));
 
         const { data, error } = await supabase.auth.getUser(token);
-
-        if (error || !data?.user) {
-            return next(new Error('UNAUTHORIZED: invalid token'));
-        }
+        if (error || !data?.user) return next(new Error('UNAUTHORIZED'));
 
         socket.user = data.user;
         next();
-
-    } catch (err) {
+    } catch {
         next(new Error('UNAUTHORIZED'));
     }
 });
 
-/**
- * Diffuse l'état complet de la partie
- */
+// ==========================
+// BROADCAST
+// ==========================
+
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
     if (!room) return;
+
+    const currentPlayer =
+        room.players[room.gameState.currentPlayerIndex];
 
     io.to(roomId).emit('gameStateUpdate', {
         roomId: room.id,
         ...room.gameState,
         nbCards: Engine.getCardsCount(room.gameState.currentRound),
-        currentPlayer: room.players[room.gameState.currentPlayerIndex]?.id,
+
+        // 🔥 Stable pour le front
+        currentPlayerUserId: currentPlayer?.userId,
+
         players: room.players.map(p => ({
-            id: p.id,
+            id: p.id,               // socketId (temporaire)
+            userId: p.userId,       // ✅ identifiant stable
             name: p.name,
             bid: p.bid,
             tricksWon: p.tricksWon,
@@ -94,6 +98,10 @@ function broadcast(roomId) {
         }))
     });
 }
+
+// ==========================
+// SOCKET CONNECTION
+// ==========================
 
 io.on('connection', (socket) => {
 
@@ -131,9 +139,11 @@ io.on('connection', (socket) => {
 
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
-            socket.emit('tableUpdate', { table: room.gameState.table });
         }
-        else if (room.players.length === 4 && room.gameState.status === 'WAITING') {
+        else if (
+            room.players.length === 4 &&
+            room.gameState.status === 'WAITING'
+        ) {
             startNewRound(room);
         }
 
@@ -141,22 +151,25 @@ io.on('connection', (socket) => {
     });
 
     // ==========================
-    // PARIS
+    // PLACE BID
     // ==========================
 
     socket.on('placeBid', (bidValue) => {
 
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-
         if (!room || room.gameState.status !== 'BIDDING') return;
 
-        const player = room.players[room.gameState.currentPlayerIndex];
+        const player =
+            room.players[room.gameState.currentPlayerIndex];
         if (!player || player.id !== socket.id) return;
 
-        const nbCards = Engine.getCardsCount(room.gameState.currentRound);
+        const nbCards =
+            Engine.getCardsCount(room.gameState.currentRound);
 
-        if (typeof bidValue !== 'number' || bidValue < 0 || bidValue > nbCards) {
+        if (typeof bidValue !== 'number' ||
+            bidValue < 0 ||
+            bidValue > nbCards) {
             return socket.emit('error_message', "Pari invalide.");
         }
 
@@ -164,7 +177,8 @@ io.on('connection', (socket) => {
             .filter(p => p.bid !== null)
             .map(p => p.bid);
 
-        const forbidden = Engine.getForbiddenBid(nbCards, bidsSoFar);
+        const forbidden =
+            Engine.getForbiddenBid(nbCards, bidsSoFar);
 
         if (forbidden !== null && bidValue === forbidden) {
             return socket.emit(
@@ -187,7 +201,7 @@ io.on('connection', (socket) => {
     });
 
     // ==========================
-    // JOUER CARTE
+    // PLAY CARD
     // ==========================
 
     socket.on('playCard', (card) => {
@@ -199,18 +213,21 @@ io.on('connection', (socket) => {
             room.gameState.status !== 'PLAYING' ||
             room.gameState.table.length >= 4) return;
 
-        const player = room.players[room.gameState.currentPlayerIndex];
+        const player =
+            room.players[room.gameState.currentPlayerIndex];
         if (!player || player.id !== socket.id) return;
 
         const hasCard = player.hand.some(
-            c => c.suit === card?.suit && c.value === card?.value
+            c => c.suit === card?.suit &&
+                c.value === card?.value
         );
 
         if (!hasCard) {
             return socket.emit('error_message', "Carte invalide.");
         }
 
-        const trumpSuit = room.gameState.trump?.suit || 'SA';
+        const trumpSuit =
+            room.gameState.trump?.suit || 'SA';
 
         if (!Engine.isMoveLegal(
             player.hand,
@@ -225,26 +242,30 @@ io.on('connection', (socket) => {
         }
 
         room.gameState.table.push({
+            playerId: player.userId,   // ✅ stable
             playerName: player.name,
             card
         });
 
         player.hand = player.hand.filter(
-            c => !(c.suit === card.suit && c.value === card.value)
+            c => !(c.suit === card.suit &&
+                c.value === card.value)
         );
 
         if (room.gameState.table.length === 4) {
 
             broadcast(roomId);
 
-            const winnerMove = Engine.evaluateTrick(
-                room.gameState.table,
-                trumpSuit
-            );
+            const winnerMove =
+                Engine.evaluateTrick(
+                    room.gameState.table,
+                    trumpSuit
+                );
 
-            const winner = room.players.find(
-                p => p.name === winnerMove?.playerName
-            );
+            const winner =
+                room.players.find(
+                    p => p.userId === winnerMove?.playerId
+                );
 
             if (!winner) return;
 
@@ -258,7 +279,9 @@ io.on('connection', (socket) => {
             });
 
             const isRoundOver =
-                room.players.every(p => p.hand.length === 0);
+                room.players.every(
+                    p => p.hand.length === 0
+                );
 
             setTimeout(() => {
 
@@ -272,6 +295,7 @@ io.on('connection', (socket) => {
             }, 2500);
 
         } else {
+
             room.gameState.currentPlayerIndex =
                 (room.gameState.currentPlayerIndex + 1) % 4;
 
@@ -280,7 +304,8 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        const roomId = RoomManager.handleDisconnect(socket, io);
+        const roomId =
+            RoomManager.handleDisconnect(socket, io);
         if (roomId) broadcast(roomId);
     });
 
@@ -294,7 +319,8 @@ function startNewRound(room) {
 
     room.gameState.status = 'BIDDING';
 
-    const nb = Engine.getCardsCount(room.gameState.currentRound);
+    const nb =
+        Engine.getCardsCount(room.gameState.currentRound);
     const deck = Engine.createDeck();
 
     room.players.forEach(p => {
@@ -316,13 +342,19 @@ function startNewRound(room) {
     broadcast(room.id);
 }
 
+// ==========================
+// FINISH ROUND
+// ==========================
+
 function finishRound(room) {
 
     const roundRes = {
         round: room.gameState.currentRound,
         results: room.players.map(p => {
 
-            const pts = Engine.calculatePoints(p.bid, p.tricksWon);
+            const pts =
+                Engine.calculatePoints(p.bid, p.tricksWon);
+
             p.score += pts;
 
             return {
