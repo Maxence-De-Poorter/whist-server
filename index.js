@@ -6,16 +6,22 @@ const { Server } = require("socket.io");
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 
-const RoomManager = require('./roomManager');
-const Engine = require('./gameEngine');
+const { roomManager: RoomManager } = require('./roomManager');
+const { normalizeRoomId } = require('./validators');
+const { serializeGameState } = require('./stateSerializer');
+const GameService = require('./gameService');
+const Engine = require('./gameEngine'); // utile pour nbCards dans certains messages
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+    origin: "*", // ⚠️ en prod: mets ton domaine (ex: https://tonsite.com)
+    methods: ["GET", "POST"]
+}));
 
 // ==========================
 // SUPABASE SERVER CLIENT
 // ==========================
-
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -24,20 +30,15 @@ const supabase = createClient(
 // ==========================
 // ROUTES REST
 // ==========================
-
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
+app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/rooms', (req, res) => {
-    const rooms = RoomManager.getPublicRooms();
-    res.json(rooms);
+    res.json(RoomManager.getPublicRooms());
 });
 
 // ==========================
 // SOCKET.IO
 // ==========================
-
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -52,7 +53,6 @@ const io = new Server(server, {
 // ==========================
 // AUTH MIDDLEWARE
 // ==========================
-
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
@@ -69,82 +69,60 @@ io.use(async (socket, next) => {
 });
 
 // ==========================
-// BROADCAST
+// HELPERS
 // ==========================
-
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
     if (!room) return;
-
-    const currentPlayer =
-        room.players[room.gameState.currentPlayerIndex];
-
-    io.to(roomId).emit('gameStateUpdate', {
-        roomId: room.id,
-        ...room.gameState,
-        nbCards: Engine.getCardsCount(room.gameState.currentRound),
-
-        // 🔥 Stable pour le front
-        currentPlayerUserId: currentPlayer?.userId,
-
-        players: room.players.map(p => ({
-            id: p.id,               // socketId (temporaire)
-            userId: p.userId,       // ✅ identifiant stable
-            name: p.name,
-            bid: p.bid,
-            tricksWon: p.tricksWon,
-            score: p.score,
-            online: p.online
-        }))
-    });
+    io.to(roomId).emit('gameStateUpdate', serializeGameState(room));
 }
+
+/**
+ * IMPORTANT:
+ * - Le serveur ne fait aucun setTimeout.
+ * - Le front anime, puis envoie ackTrickAnimation pour que le serveur reset la table.
+ * - Même logique après roundFinished si tu veux animer: tu peux faire un ackRoundAnimation
+ *   (pas obligatoire ici, on démarre le round direct après ackTrickAnimation).
+ */
 
 // ==========================
 // SOCKET CONNECTION
 // ==========================
-
 io.on('connection', (socket) => {
-
     console.log(`📡 Connexion authentifiée : ${socket.user.email}`);
 
     // ==========================
     // JOIN ROOM
     // ==========================
-
     socket.on('joinRoom', ({ roomId }) => {
-
-        if (!roomId) {
-            return socket.emit('error_message', "Room ID invalide.");
-        }
+        const normalized = normalizeRoomId(roomId);
+        if (!normalized) return socket.emit('error_message', "Room ID invalide.");
 
         const user = socket.user;
-
         const pseudo =
             user.user_metadata?.display_name ||
             user.email ||
             "Joueur";
 
-        const result = RoomManager.createOrJoin(roomId, socket, {
+        const result = RoomManager.createOrJoin(normalized, socket, {
             userId: user.id,
             pseudo
         });
 
-        if (result.error) {
-            return socket.emit('error_message', result.error);
-        }
+        if (result.error) return socket.emit('error_message', result.error);
 
         const { room, player, isReconnection } = result;
 
         socket.join(room.id);
 
+        // Si reconnexion => on renvoie la main
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
-        }
-        else if (
-            room.players.length === 4 &&
-            room.gameState.status === 'WAITING'
-        ) {
-            startNewRound(room);
+        } else {
+            // Si 4 joueurs et en attente => start round
+            if (room.players.length === 4 && room.gameState.status === 'WAITING') {
+                GameService.startNewRound(room, io);
+            }
         }
 
         broadcast(room.id);
@@ -153,239 +131,110 @@ io.on('connection', (socket) => {
     // ==========================
     // PLACE BID
     // ==========================
-
     socket.on('placeBid', (bidValue) => {
-
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room || room.gameState.status !== 'BIDDING') return;
+        if (!room) return;
 
-        const player =
-            room.players[room.gameState.currentPlayerIndex];
-        if (!player || player.id !== socket.id) return;
+        // (Optionnel) Interdire si joueur offline / game pas dans l'état
+        const res = GameService.placeBid(room, socket.id, bidValue);
 
-        const nbCards =
-            Engine.getCardsCount(room.gameState.currentRound);
-
-        if (typeof bidValue !== 'number' ||
-            bidValue < 0 ||
-            bidValue > nbCards) {
-            return socket.emit('error_message', "Pari invalide.");
+        if (!res.ok && res.error) {
+            return socket.emit('error_message', res.error);
         }
 
-        const bidsSoFar = room.players
-            .filter(p => p.bid !== null)
-            .map(p => p.bid);
-
-        const forbidden =
-            Engine.getForbiddenBid(nbCards, bidsSoFar);
-
-        if (forbidden !== null && bidValue === forbidden) {
-            return socket.emit(
-                'error_message',
-                `Pari interdit ! Le total ne doit pas être égal à ${nbCards}.`
-            );
-        }
-
-        player.bid = bidValue;
-        room.gameState.currentPlayerIndex =
-            (room.gameState.currentPlayerIndex + 1) % 4;
-
-        if (room.players.every(p => p.bid !== null)) {
-            room.gameState.status = 'PLAYING';
-            room.gameState.currentPlayerIndex =
-                (room.gameState.dealerIndex + 1) % 4;
-        }
-
-        broadcast(roomId);
+        // Si tu veux ré-afficher nbCards côté front même en bidding:
+        // (déjà inclus via serializeGameState)
+        broadcast(room.id);
     });
 
     // ==========================
     // PLAY CARD
     // ==========================
-
     socket.on('playCard', (card) => {
-
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
+        if (!room) return;
 
-        if (!room ||
-            room.gameState.status !== 'PLAYING' ||
-            room.gameState.table.length >= 4) return;
+        const res = GameService.playCard(room, socket.id, card);
 
-        const player =
-            room.players[room.gameState.currentPlayerIndex];
-        if (!player || player.id !== socket.id) return;
-
-        const hasCard = player.hand.some(
-            c => c.suit === card?.suit &&
-                c.value === card?.value
-        );
-
-        if (!hasCard) {
-            return socket.emit('error_message', "Carte invalide.");
+        if (!res.ok && res.error) {
+            return socket.emit('error_message', res.error);
         }
 
-        const trumpSuit =
-            room.gameState.trump?.suit || 'SA';
+        // Broadcast immédiat de l'état après action
+        broadcast(room.id);
 
-        if (!Engine.isMoveLegal(
-            player.hand,
-            card,
-            room.gameState.table,
-            trumpSuit
-        )) {
-            return socket.emit(
-                'error_message',
-                "Coup illégal ! Vous devez fournir ou couper."
-            );
+        // Si pli terminé => on émet un event spécifique pour que le front anime
+        if (res.trickCompleted) {
+            io.to(room.id).emit('trickResolved', {
+                winnerName: res.winnerName,
+                table: res.table,
+                roundOver: res.roundOver
+            });
+            // NOTE: la table reste en mémoire tant que le front n'a pas ack.
+            // Le front doit ensuite appeler ackTrickAnimation.
+        }
+    });
+
+    // ==========================
+    // ACK: FIN ANIMATION DE PLI
+    // ==========================
+    socket.on('ackTrickAnimation', () => {
+        const roomId = RoomManager.socketToRoom.get(socket.id);
+        const room = RoomManager.getRoom(roomId);
+        if (!room) return;
+
+        // Sécurité minimale: si pas de pli complet affiché, ignore
+        if (!Array.isArray(room.gameState.table) || room.gameState.table.length !== 4) {
+            return;
         }
 
-        room.gameState.table.push({
-            playerId: player.userId,   // ✅ stable
-            playerName: player.name,
-            card
-        });
+        // Reset table
+        room.gameState.table = [];
 
-        player.hand = player.hand.filter(
-            c => !(c.suit === card.suit &&
-                c.value === card.value)
-        );
+        // Si round terminé (toutes les mains vides) => calcul points + manche suivante
+        const isRoundOver = room.players.every(p => p.hand.length === 0);
 
-        if (room.gameState.table.length === 4) {
+        if (isRoundOver) {
+            const res = GameService.finishRound(room);
 
-            broadcast(roomId);
-
-            const winnerMove =
-                Engine.evaluateTrick(
-                    room.gameState.table,
-                    trumpSuit
-                );
-
-            const winner =
-                room.players.find(
-                    p => p.userId === winnerMove?.playerId
-                );
-
-            if (!winner) return;
-
-            winner.tricksWon++;
-            room.gameState.currentPlayerIndex =
-                room.players.indexOf(winner);
-
-            io.to(roomId).emit('trickOver', {
-                winnerName: winner.name,
-                table: room.gameState.table
+            // On notifie les résultats de la manche (scoreHistory dernier élément)
+            const last = room.gameState.scoreHistory[room.gameState.scoreHistory.length - 1];
+            io.to(room.id).emit('roundFinished', {
+                round: last?.round,
+                results: last?.results,
+                nextRound: !res.gameOver
             });
 
-            const isRoundOver =
-                room.players.every(
-                    p => p.hand.length === 0
-                );
+            if (res.gameOver) {
+                io.to(room.id).emit('gameOver', room.players);
+                // status déjà FINISHED côté service
+                broadcast(room.id);
+                return;
+            }
 
-            setTimeout(() => {
-
-                if (!RoomManager.getRoom(roomId)) return;
-
-                room.gameState.table = [];
-
-                if (isRoundOver) finishRound(room);
-                else broadcast(roomId);
-
-            }, 2500);
-
-        } else {
-
-            room.gameState.currentPlayerIndex =
-                (room.gameState.currentPlayerIndex + 1) % 4;
-
-            broadcast(roomId);
+            // Démarre la manche suivante immédiatement (sans timeout)
+            GameService.startNewRound(room, io);
         }
+
+        broadcast(room.id);
     });
 
+    // ==========================
+    // DISCONNECT
+    // ==========================
     socket.on('disconnect', () => {
-        const roomId =
-            RoomManager.handleDisconnect(socket, io);
+        const roomId = RoomManager.handleDisconnect(socket);
         if (roomId) broadcast(roomId);
     });
-
 });
 
 // ==========================
-// START ROUND
+// START SERVER
 // ==========================
-
-function startNewRound(room) {
-
-    room.gameState.status = 'BIDDING';
-
-    const nb =
-        Engine.getCardsCount(room.gameState.currentRound);
-    const deck = Engine.createDeck();
-
-    room.players.forEach(p => {
-        p.hand = deck.splice(0, nb);
-        p.bid = null;
-        p.tricksWon = 0;
-
-        io.to(p.id).emit('yourHand', p.hand);
-    });
-
-    room.gameState.trump =
-        deck.length > 0
-            ? deck[0]
-            : { suit: 'SA', value: 'Sans Atout' };
-
-    room.gameState.currentPlayerIndex =
-        (room.gameState.dealerIndex + 1) % 4;
-
-    broadcast(room.id);
-}
-
-// ==========================
-// FINISH ROUND
-// ==========================
-
-function finishRound(room) {
-
-    const roundRes = {
-        round: room.gameState.currentRound,
-        results: room.players.map(p => {
-
-            const pts =
-                Engine.calculatePoints(p.bid, p.tricksWon);
-
-            p.score += pts;
-
-            return {
-                bid: p.bid,
-                points: pts,
-                total: p.score
-            };
-        })
-    };
-
-    room.gameState.scoreHistory.push(roundRes);
-    room.gameState.currentRound++;
-    room.gameState.dealerIndex =
-        (room.gameState.dealerIndex + 1) % 4;
-
-    setTimeout(() => {
-
-        if (!RoomManager.getRoom(room.id)) return;
-
-        if (room.gameState.currentRound <= 18) {
-            startNewRound(room);
-        } else {
-            io.to(room.id).emit('gameOver', room.players);
-            room.gameState.status = 'FINISHED';
-        }
-
-    }, 4000);
-}
-
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () =>
-    console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`)
-);
+server.listen(PORT, () => {
+    console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`);
+});

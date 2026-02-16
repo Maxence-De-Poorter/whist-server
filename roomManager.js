@@ -1,5 +1,6 @@
-class RoomManager {
+const { normalizeRoomId } = require('./validators');
 
+class RoomManager {
     constructor() {
         this.rooms = new Map();
         this.socketToRoom = new Map();
@@ -7,22 +8,17 @@ class RoomManager {
 
     getRoom(roomId) {
         if (!roomId) return null;
-        return this.rooms.get(roomId.toUpperCase()) || null;
+        return this.rooms.get(roomId) || null;
     }
 
-    createOrJoin(roomId, socket, user) {
+    ensureRoom(roomId) {
+        const id = normalizeRoomId(roomId);
+        if (!id) return null;
 
-        if (!roomId || !user?.userId || !user?.pseudo) {
-            return { error: "Paramètres invalides." };
-        }
-
-        roomId = roomId.toUpperCase().trim();
-
-        let room = this.rooms.get(roomId);
-
+        let room = this.rooms.get(id);
         if (!room) {
             room = {
-                id: roomId,
+                id,
                 players: [],
                 gameState: {
                     currentRound: 1,
@@ -33,40 +29,53 @@ class RoomManager {
                     table: [],
                     scoreHistory: []
                 },
-                timers: new Map()
+                meta: {
+                    timersByUserId: new Map(),
+                    createdAt: Date.now(),
+                    lastActivityAt: Date.now()
+                }
             };
-            this.rooms.set(roomId, room);
+            this.rooms.set(id, room);
         }
 
-        const existingPlayer =
-            room.players.find(p => p.userId === user.userId);
+        return room;
+    }
+
+    touch(room) {
+        if (room?.meta) room.meta.lastActivityAt = Date.now();
+    }
+
+    createOrJoin(roomId, socket, user) {
+        if (!user?.userId || !user?.pseudo)
+            return { error: "Paramètres invalides." };
+
+        const room = this.ensureRoom(roomId);
+        if (!room) return { error: "Room ID invalide." };
+
+        this.touch(room);
+
+        const existingPlayer = room.players.find(p => p.userId === user.userId);
 
         if (existingPlayer) {
-
-            if (existingPlayer.online) {
+            if (existingPlayer.online)
                 return { error: "Vous êtes déjà connecté." };
-            }
 
             existingPlayer.id = socket.id;
             existingPlayer.online = true;
 
-            this.socketToRoom.set(socket.id, roomId);
+            this.socketToRoom.set(socket.id, room.id);
 
-            if (room.timers.has(user.userId)) {
-                clearTimeout(room.timers.get(user.userId));
-                room.timers.delete(user.userId);
+            const timers = room.meta.timersByUserId;
+            if (timers.has(user.userId)) {
+                clearTimeout(timers.get(user.userId));
+                timers.delete(user.userId);
             }
 
-            return {
-                room,
-                player: existingPlayer,
-                isReconnection: true
-            };
+            return { room, player: existingPlayer, isReconnection: true };
         }
 
-        if (room.players.length >= 4) {
+        if (room.players.length >= 4)
             return { error: "La salle est pleine." };
-        }
 
         const newPlayer = {
             id: socket.id,
@@ -80,17 +89,12 @@ class RoomManager {
         };
 
         room.players.push(newPlayer);
-        this.socketToRoom.set(socket.id, roomId);
+        this.socketToRoom.set(socket.id, room.id);
 
-        return {
-            room,
-            player: newPlayer,
-            isReconnection: false
-        };
+        return { room, player: newPlayer, isReconnection: false };
     }
 
-    handleDisconnect(socket, io) {
-
+    handleDisconnect(socket) {
         const roomId = this.socketToRoom.get(socket.id);
         if (!roomId) return null;
 
@@ -102,49 +106,38 @@ class RoomManager {
 
         player.online = false;
         this.socketToRoom.delete(socket.id);
+        this.touch(room);
 
         const timer = setTimeout(() => {
-
             const currentRoom = this.rooms.get(roomId);
             if (!currentRoom) return;
 
-            const stillOffline = currentRoom.players
-                .find(p => p.userId === player.userId)?.online === false;
-
-            if (stillOffline) {
-                this.deleteRoom(roomId);
-            }
-
+            const nobodyOnline = currentRoom.players.every(p => !p.online);
+            if (nobodyOnline) this.deleteRoom(roomId);
         }, 60000);
 
-        room.timers.set(player.userId, timer);
+        room.meta.timersByUserId.set(player.userId, timer);
 
         return roomId;
     }
 
     deleteRoom(roomId) {
-
         const room = this.rooms.get(roomId);
         if (!room) return;
 
-        room.timers.forEach(timer => clearTimeout(timer));
-        room.timers.clear();
+        room.meta.timersByUserId.forEach(t => clearTimeout(t));
+        room.meta.timersByUserId.clear();
 
         room.players.forEach(p => {
-            if (p.id) {
-                this.socketToRoom.delete(p.id);
-            }
+            if (p.id) this.socketToRoom.delete(p.id);
         });
 
         this.rooms.delete(roomId);
     }
 
     getPublicRooms() {
-
         const list = [];
-
         this.rooms.forEach(room => {
-
             if (room.players.length > 0) {
                 list.push({
                     id: room.id,
@@ -152,11 +145,14 @@ class RoomManager {
                     status: room.gameState.status
                 });
             }
-
         });
-
         return list;
     }
 }
 
-module.exports = new RoomManager();
+const roomManager = new RoomManager();
+
+module.exports = {
+    RoomManager,
+    roomManager
+};
