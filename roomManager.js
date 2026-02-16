@@ -16,6 +16,7 @@ class RoomManager {
         if (!id) return null;
 
         let room = this.rooms.get(id);
+
         if (!room) {
             room = {
                 id,
@@ -35,6 +36,7 @@ class RoomManager {
                     lastActivityAt: Date.now()
                 }
             };
+
             this.rooms.set(id, room);
         }
 
@@ -42,40 +44,56 @@ class RoomManager {
     }
 
     touch(room) {
-        if (room?.meta) room.meta.lastActivityAt = Date.now();
+        if (room?.meta) {
+            room.meta.lastActivityAt = Date.now();
+        }
     }
 
     createOrJoin(roomId, socket, user) {
-        if (!user?.userId || !user?.pseudo)
-            return { error: "Paramètres invalides." };
+        if (!socket?.id || !user?.userId || !user?.pseudo) {
+            return { error: 'Paramètres invalides.' };
+        }
 
         const room = this.ensureRoom(roomId);
-        if (!room) return { error: "Room ID invalide." };
+        if (!room) return { error: 'Room ID invalide.' };
 
         this.touch(room);
 
-        const existingPlayer = room.players.find(p => p.userId === user.userId);
+        const existingPlayer = room.players.find(
+            (p) => p.userId === user.userId
+        );
 
+        // 🔁 Reconnexion
         if (existingPlayer) {
-            if (existingPlayer.online)
-                return { error: "Vous êtes déjà connecté." };
+            if (existingPlayer.online) {
+                return { error: 'Vous êtes déjà connecté.' };
+            }
 
             existingPlayer.id = socket.id;
             existingPlayer.online = true;
 
             this.socketToRoom.set(socket.id, room.id);
 
+            // Clear ancien timer
             const timers = room.meta.timersByUserId;
-            if (timers.has(user.userId)) {
-                clearTimeout(timers.get(user.userId));
+            const existingTimer = timers.get(user.userId);
+
+            if (existingTimer) {
+                clearTimeout(existingTimer);
                 timers.delete(user.userId);
             }
 
-            return { room, player: existingPlayer, isReconnection: true };
+            return {
+                room,
+                player: existingPlayer,
+                isReconnection: true
+            };
         }
 
-        if (room.players.length >= 4)
-            return { error: "La salle est pleine." };
+        // 🚫 Salle pleine
+        if (room.players.length >= 4) {
+            return { error: 'La salle est pleine.' };
+        }
 
         const newPlayer = {
             id: socket.id,
@@ -91,32 +109,53 @@ class RoomManager {
         room.players.push(newPlayer);
         this.socketToRoom.set(socket.id, room.id);
 
-        return { room, player: newPlayer, isReconnection: false };
+        return {
+            room,
+            player: newPlayer,
+            isReconnection: false
+        };
     }
 
     handleDisconnect(socket) {
+        if (!socket?.id) return null;
+
         const roomId = this.socketToRoom.get(socket.id);
         if (!roomId) return null;
 
         const room = this.rooms.get(roomId);
-        if (!room) return null;
+        if (!room) {
+            this.socketToRoom.delete(socket.id);
+            return null;
+        }
 
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player) return null;
+        const player = room.players.find(
+            (p) => p.id === socket.id
+        );
+
+        if (!player) {
+            this.socketToRoom.delete(socket.id);
+            return null;
+        }
 
         player.online = false;
         this.socketToRoom.delete(socket.id);
         this.touch(room);
 
-        const timer = setTimeout(() => {
+        // ⏳ Timer suppression salle si personne ne revient
+        const timeout = setTimeout(() => {
             const currentRoom = this.rooms.get(roomId);
             if (!currentRoom) return;
 
-            const nobodyOnline = currentRoom.players.every(p => !p.online);
-            if (nobodyOnline) this.deleteRoom(roomId);
+            const nobodyOnline = currentRoom.players.every(
+                (p) => !p.online
+            );
+
+            if (nobodyOnline) {
+                this.deleteRoom(roomId);
+            }
         }, 60000);
 
-        room.meta.timersByUserId.set(player.userId, timer);
+        room.meta.timersByUserId.set(player.userId, timeout);
 
         return roomId;
     }
@@ -125,11 +164,17 @@ class RoomManager {
         const room = this.rooms.get(roomId);
         if (!room) return;
 
-        room.meta.timersByUserId.forEach(t => clearTimeout(t));
+        // Clear tous les timers
+        room.meta.timersByUserId.forEach((timer) =>
+            clearTimeout(timer)
+        );
         room.meta.timersByUserId.clear();
 
-        room.players.forEach(p => {
-            if (p.id) this.socketToRoom.delete(p.id);
+        // Nettoyage socket map
+        room.players.forEach((p) => {
+            if (p.id) {
+                this.socketToRoom.delete(p.id);
+            }
         });
 
         this.rooms.delete(roomId);
@@ -137,16 +182,38 @@ class RoomManager {
 
     getPublicRooms() {
         const list = [];
-        this.rooms.forEach(room => {
+
+        this.rooms.forEach((room) => {
             if (room.players.length > 0) {
                 list.push({
                     id: room.id,
                     players: room.players.length,
-                    status: room.gameState.status
+                    status: room.gameState.status,
+                    lastActivityAt: room.meta.lastActivityAt
                 });
             }
         });
+
         return list;
+    }
+
+    /**
+     * Optionnel : nettoyage périodique des rooms inactives
+     * (utile en prod Fly pour éviter accumulation mémoire)
+     */
+    cleanupInactiveRooms(maxIdleMs = 10 * 60 * 1000) {
+        const now = Date.now();
+
+        this.rooms.forEach((room, roomId) => {
+            const idleTime = now - room.meta.lastActivityAt;
+
+            if (
+                idleTime > maxIdleMs &&
+                room.players.every((p) => !p.online)
+            ) {
+                this.deleteRoom(roomId);
+            }
+        });
     }
 }
 

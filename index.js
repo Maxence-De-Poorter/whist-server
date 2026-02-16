@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const http = require('http');
-const { Server } = require("socket.io");
+const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -23,17 +23,24 @@ app.use(helmet());
 
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false
 }));
 
 app.use(cors({
-    origin: process.env.FRONT_URL || "*",
-    methods: ["GET", "POST"]
+    origin: process.env.FRONT_URL || false,
+    methods: ['GET', 'POST'],
+    credentials: true
 }));
 
 // ==========================
 // SUPABASE SERVER CLIENT
 // ==========================
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase environment variables missing');
+}
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -45,7 +52,9 @@ const supabase = createClient(
 // ==========================
 
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/rooms', (req, res) => res.json(RoomManager.getPublicRooms()));
+app.get('/rooms', (req, res) =>
+    res.json(RoomManager.getPublicRooms())
+);
 
 // ==========================
 // SOCKET.IO SETUP
@@ -55,15 +64,16 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: process.env.FRONT_URL || "*",
-        methods: ["GET", "POST"]
+        origin: process.env.FRONT_URL || false,
+        methods: ['GET', 'POST'],
+        credentials: true
     },
     pingTimeout: 60000,
     pingInterval: 25000
 });
 
 // ==========================
-// RATE LIMIT (SOCKET)
+// SOCKET RATE LIMIT
 // ==========================
 
 const RATE_LIMIT_WINDOW = 1000;
@@ -85,13 +95,18 @@ function isRateLimited(socket) {
     }
 
     data.count++;
-
-    if (data.count > MAX_ACTIONS_PER_WINDOW) {
-        return true;
-    }
-
-    return false;
+    return data.count > MAX_ACTIONS_PER_WINDOW;
 }
+
+// Nettoyage automatique anti memory leak
+setInterval(() => {
+    const now = Date.now();
+    actionTracker.forEach((data, socketId) => {
+        if (now - data.timestamp > RATE_LIMIT_WINDOW) {
+            actionTracker.delete(socketId);
+        }
+    });
+}, 5000);
 
 // ==========================
 // AUTH MIDDLEWARE
@@ -103,7 +118,10 @@ io.use(async (socket, next) => {
         if (!token) return next(new Error('UNAUTHORIZED'));
 
         const { data, error } = await supabase.auth.getUser(token);
-        if (error || !data?.user) return next(new Error('UNAUTHORIZED'));
+
+        if (error || !data?.user) {
+            return next(new Error('UNAUTHORIZED'));
+        }
 
         socket.user = data.user;
         next();
@@ -119,7 +137,13 @@ io.use(async (socket, next) => {
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
     if (!room) return;
-    io.to(roomId).emit('gameStateUpdate', serializeGameState(room));
+
+    RoomManager.touch(room);
+
+    io.to(roomId).emit(
+        'gameStateUpdate',
+        serializeGameState(room)
+    );
 }
 
 // ==========================
@@ -132,20 +156,24 @@ io.on('connection', (socket) => {
         if (isRateLimited(socket)) return;
 
         const normalized = normalizeRoomId(roomId);
-        if (!normalized) return socket.emit('error_message', "Room ID invalide.");
+        if (!normalized)
+            return socket.emit('error_message', 'Room ID invalide.');
 
         const user = socket.user;
+
         const pseudo =
             user.user_metadata?.display_name ||
             user.email ||
-            "Joueur";
+            'Joueur';
 
-        const result = RoomManager.createOrJoin(normalized, socket, {
-            userId: user.id,
-            pseudo
-        });
+        const result = RoomManager.createOrJoin(
+            normalized,
+            socket,
+            { userId: user.id, pseudo }
+        );
 
-        if (result.error) return socket.emit('error_message', result.error);
+        if (result.error)
+            return socket.emit('error_message', result.error);
 
         const { room, player, isReconnection } = result;
 
@@ -153,7 +181,10 @@ io.on('connection', (socket) => {
 
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
-        } else if (room.players.length === 4 && room.gameState.status === 'WAITING') {
+        } else if (
+            room.players.length === 4 &&
+            room.gameState.status === 'WAITING'
+        ) {
             GameService.startNewRound(room, io);
         }
 
@@ -165,12 +196,13 @@ io.on('connection', (socket) => {
 
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room || room.gameState.status !== 'BIDDING') return;
+        if (!room) return;
 
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player || !player.online) return;
-
-        const res = GameService.placeBid(room, socket.id, bidValue);
+        const res = GameService.placeBid(
+            room,
+            socket.id,
+            bidValue
+        );
 
         if (!res.ok && res.error)
             return socket.emit('error_message', res.error);
@@ -183,12 +215,13 @@ io.on('connection', (socket) => {
 
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room || room.gameState.status !== 'PLAYING') return;
+        if (!room) return;
 
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player || !player.online) return;
-
-        const res = GameService.playCard(room, socket.id, card);
+        const res = GameService.playCard(
+            room,
+            socket.id,
+            card
+        );
 
         if (!res.ok && res.error)
             return socket.emit('error_message', res.error);
@@ -211,28 +244,37 @@ io.on('connection', (socket) => {
 
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room || room.gameState.status !== 'PLAYING') return;
+        if (!room) return;
 
-        const player = room.players.find(p => p.id === socket.id);
+        const player = room.players.find(
+            (p) => p.id === socket.id
+        );
         if (!player || !player.online) return;
 
-        if (!room.gameState.pendingTrickAcks)
+        if (!room.gameState.pendingTrickAcks) {
             room.gameState.pendingTrickAcks = new Set();
+        }
 
         room.gameState.pendingTrickAcks.add(player.userId);
 
-        if (room.gameState.pendingTrickAcks.size < room.players.length)
+        if (
+            room.gameState.pendingTrickAcks.size <
+            room.players.length
+        ) {
             return;
+        }
 
         room.gameState.pendingTrickAcks.clear();
-        room.gameState.table = [];
 
-        const isRoundOver = room.players.every(p => p.hand.length === 0);
+        const isRoundOver = room.players.every(
+            (p) => p.hand.length === 0
+        );
 
         if (isRoundOver) {
             const res = GameService.finishRound(room);
 
-            const last = room.gameState.scoreHistory.at(-1);
+            const last =
+                room.gameState.scoreHistory.at(-1);
 
             io.to(room.id).emit('roundFinished', {
                 round: last?.round,
@@ -253,6 +295,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
+        actionTracker.delete(socket.id);
         const roomId = RoomManager.handleDisconnect(socket);
         if (roomId) broadcast(roomId);
     });
@@ -265,5 +308,5 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () =>
-    console.log(`🃏 SERVEUR WHIST SÉCURISÉ SUR LE PORT ${PORT}`)
+    console.log(`🃏 WHIST SERVER RUNNING ON PORT ${PORT}`)
 );
