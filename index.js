@@ -4,46 +4,58 @@ const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const { roomManager: RoomManager } = require('./roomManager');
 const { normalizeRoomId } = require('./validators');
 const { serializeGameState } = require('./stateSerializer');
 const GameService = require('./gameService');
-const Engine = require('./gameEngine'); // utile pour nbCards dans certains messages
 
 const app = express();
 
+// ==========================
+// SECURITY MIDDLEWARE
+// ==========================
+
+app.use(helmet());
+
+app.use(rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200
+}));
+
 app.use(cors({
-    origin: "*", // ⚠️ en prod: mets ton domaine (ex: https://tonsite.com)
+    origin: process.env.FRONT_URL || "*",
     methods: ["GET", "POST"]
 }));
 
 // ==========================
 // SUPABASE SERVER CLIENT
 // ==========================
+
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // ==========================
-// ROUTES REST
+// REST ROUTES
 // ==========================
+
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-
-app.get('/rooms', (req, res) => {
-    res.json(RoomManager.getPublicRooms());
-});
+app.get('/rooms', (req, res) => res.json(RoomManager.getPublicRooms()));
 
 // ==========================
-// SOCKET.IO
+// SOCKET.IO SETUP
 // ==========================
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: process.env.FRONT_URL || "*",
         methods: ["GET", "POST"]
     },
     pingTimeout: 60000,
@@ -51,8 +63,40 @@ const io = new Server(server, {
 });
 
 // ==========================
+// RATE LIMIT (SOCKET)
+// ==========================
+
+const RATE_LIMIT_WINDOW = 1000;
+const MAX_ACTIONS_PER_WINDOW = 8;
+const actionTracker = new Map();
+
+function isRateLimited(socket) {
+    const now = Date.now();
+    const data = actionTracker.get(socket.id);
+
+    if (!data) {
+        actionTracker.set(socket.id, { count: 1, timestamp: now });
+        return false;
+    }
+
+    if (now - data.timestamp > RATE_LIMIT_WINDOW) {
+        actionTracker.set(socket.id, { count: 1, timestamp: now });
+        return false;
+    }
+
+    data.count++;
+
+    if (data.count > MAX_ACTIONS_PER_WINDOW) {
+        return true;
+    }
+
+    return false;
+}
+
+// ==========================
 // AUTH MIDDLEWARE
 // ==========================
+
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
@@ -69,32 +113,24 @@ io.use(async (socket, next) => {
 });
 
 // ==========================
-// HELPERS
+// BROADCAST
 // ==========================
+
 function broadcast(roomId) {
     const room = RoomManager.getRoom(roomId);
     if (!room) return;
     io.to(roomId).emit('gameStateUpdate', serializeGameState(room));
 }
 
-/**
- * IMPORTANT:
- * - Le serveur ne fait aucun setTimeout.
- * - Le front anime, puis envoie ackTrickAnimation pour que le serveur reset la table.
- * - Même logique après roundFinished si tu veux animer: tu peux faire un ackRoundAnimation
- *   (pas obligatoire ici, on démarre le round direct après ackTrickAnimation).
- */
+// ==========================
+// SOCKET EVENTS
+// ==========================
 
-// ==========================
-// SOCKET CONNECTION
-// ==========================
 io.on('connection', (socket) => {
-    console.log(`📡 Connexion authentifiée : ${socket.user.email}`);
 
-    // ==========================
-    // JOIN ROOM
-    // ==========================
     socket.on('joinRoom', ({ roomId }) => {
+        if (isRateLimited(socket)) return;
+
         const normalized = normalizeRoomId(roomId);
         if (!normalized) return socket.emit('error_message', "Room ID invalide.");
 
@@ -115,92 +151,89 @@ io.on('connection', (socket) => {
 
         socket.join(room.id);
 
-        // Si reconnexion => on renvoie la main
         if (isReconnection) {
             socket.emit('yourHand', player.hand);
-        } else {
-            // Si 4 joueurs et en attente => start round
-            if (room.players.length === 4 && room.gameState.status === 'WAITING') {
-                GameService.startNewRound(room, io);
-            }
+        } else if (room.players.length === 4 && room.gameState.status === 'WAITING') {
+            GameService.startNewRound(room, io);
         }
 
         broadcast(room.id);
     });
 
-    // ==========================
-    // PLACE BID
-    // ==========================
     socket.on('placeBid', (bidValue) => {
+        if (isRateLimited(socket)) return;
+
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room) return;
+        if (!room || room.gameState.status !== 'BIDDING') return;
 
-        // (Optionnel) Interdire si joueur offline / game pas dans l'état
+        const player = room.players.find(p => p.id === socket.id);
+        if (!player || !player.online) return;
+
         const res = GameService.placeBid(room, socket.id, bidValue);
 
-        if (!res.ok && res.error) {
+        if (!res.ok && res.error)
             return socket.emit('error_message', res.error);
-        }
 
-        // Si tu veux ré-afficher nbCards côté front même en bidding:
-        // (déjà inclus via serializeGameState)
         broadcast(room.id);
     });
 
-    // ==========================
-    // PLAY CARD
-    // ==========================
     socket.on('playCard', (card) => {
+        if (isRateLimited(socket)) return;
+
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room) return;
+        if (!room || room.gameState.status !== 'PLAYING') return;
+
+        const player = room.players.find(p => p.id === socket.id);
+        if (!player || !player.online) return;
 
         const res = GameService.playCard(room, socket.id, card);
 
-        if (!res.ok && res.error) {
+        if (!res.ok && res.error)
             return socket.emit('error_message', res.error);
-        }
 
-        // Broadcast immédiat de l'état après action
         broadcast(room.id);
 
-        // Si pli terminé => on émet un event spécifique pour que le front anime
         if (res.trickCompleted) {
+            room.gameState.pendingTrickAcks = new Set();
+
             io.to(room.id).emit('trickResolved', {
                 winnerName: res.winnerName,
                 table: res.table,
                 roundOver: res.roundOver
             });
-            // NOTE: la table reste en mémoire tant que le front n'a pas ack.
-            // Le front doit ensuite appeler ackTrickAnimation.
         }
     });
 
-    // ==========================
-    // ACK: FIN ANIMATION DE PLI
-    // ==========================
     socket.on('ackTrickAnimation', () => {
+        if (isRateLimited(socket)) return;
+
         const roomId = RoomManager.socketToRoom.get(socket.id);
         const room = RoomManager.getRoom(roomId);
-        if (!room) return;
+        if (!room || room.gameState.status !== 'PLAYING') return;
 
-        // Sécurité minimale: si pas de pli complet affiché, ignore
-        if (!Array.isArray(room.gameState.table) || room.gameState.table.length !== 4) {
+        const player = room.players.find(p => p.id === socket.id);
+        if (!player || !player.online) return;
+
+        if (!room.gameState.pendingTrickAcks)
+            room.gameState.pendingTrickAcks = new Set();
+
+        room.gameState.pendingTrickAcks.add(player.userId);
+
+        if (room.gameState.pendingTrickAcks.size < room.players.length)
             return;
-        }
 
-        // Reset table
+        room.gameState.pendingTrickAcks.clear();
         room.gameState.table = [];
 
-        // Si round terminé (toutes les mains vides) => calcul points + manche suivante
         const isRoundOver = room.players.every(p => p.hand.length === 0);
 
         if (isRoundOver) {
             const res = GameService.finishRound(room);
 
-            // On notifie les résultats de la manche (scoreHistory dernier élément)
-            const last = room.gameState.scoreHistory[room.gameState.scoreHistory.length - 1];
+            const last = room.gameState.scoreHistory.at(-1);
+
             io.to(room.id).emit('roundFinished', {
                 round: last?.round,
                 results: last?.results,
@@ -209,21 +242,16 @@ io.on('connection', (socket) => {
 
             if (res.gameOver) {
                 io.to(room.id).emit('gameOver', room.players);
-                // status déjà FINISHED côté service
                 broadcast(room.id);
                 return;
             }
 
-            // Démarre la manche suivante immédiatement (sans timeout)
             GameService.startNewRound(room, io);
         }
 
         broadcast(room.id);
     });
 
-    // ==========================
-    // DISCONNECT
-    // ==========================
     socket.on('disconnect', () => {
         const roomId = RoomManager.handleDisconnect(socket);
         if (roomId) broadcast(roomId);
@@ -233,8 +261,9 @@ io.on('connection', (socket) => {
 // ==========================
 // START SERVER
 // ==========================
+
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-    console.log(`🃏 SERVEUR WHIST OPÉRATIONNEL SUR LE PORT ${PORT}`);
-});
+server.listen(PORT, () =>
+    console.log(`🃏 SERVEUR WHIST SÉCURISÉ SUR LE PORT ${PORT}`)
+);

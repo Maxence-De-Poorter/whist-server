@@ -3,6 +3,7 @@ const { isValidCard, isValidBid } = require('./validators');
 
 function startNewRound(room, io) {
     room.gameState.status = 'BIDDING';
+    room.gameState.pendingTrickAcks = new Set();
 
     const nb = Engine.getCardsCount(room.gameState.currentRound);
     const deck = Engine.createDeck();
