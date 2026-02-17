@@ -29,10 +29,10 @@ app.use(rateLimit({
 }));
 
 app.use(cors({
-    origin: ['*'],
-    methods: ['GET', 'POST'],
-    credentials: false
+    origin: true
 }));
+
+
 
 // ==========================
 // SUPABASE SERVER CLIENT
@@ -64,13 +64,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: ['*'],
-        methods: ['GET', 'POST'],
-        credentials: false
+        origin: true
     },
     pingTimeout: 60000,
     pingInterval: 25000
 });
+
+
 
 // ==========================
 // SOCKET RATE LIMIT
