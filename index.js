@@ -29,7 +29,7 @@ app.use(rateLimit({
 }));
 
 app.use(cors({
-    origin: process.env.FRONT_URL || false,
+    origin: ['*'],
     methods: ['GET', 'POST'],
     credentials: true
 }));
