@@ -31,7 +31,7 @@ app.use(rateLimit({
 app.use(cors({
     origin: ['*'],
     methods: ['GET', 'POST'],
-    credentials: true
+    credentials: false
 }));
 
 // ==========================
@@ -66,7 +66,7 @@ const io = new Server(server, {
     cors: {
         origin: ['*'],
         methods: ['GET', 'POST'],
-        credentials: true
+        credentials: false
     },
     pingTimeout: 60000,
     pingInterval: 25000
